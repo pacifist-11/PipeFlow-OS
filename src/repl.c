@@ -14,7 +14,7 @@ static pipeline_t *s_last_pipeline = NULL;
 static void print_banner(void)
 {
     printf("\n=================================================================\n");
-    printf("   PipeFlow Dataflow Stream Engine — Interactive REPL (W1-W6)   \n");
+    printf("        PipeFlow Dataflow Stream Engine — Interactive REPL       \n");
     printf("=================================================================\n");
     printf(" Commands:\n");
     printf("   run <pipeline>   - Execute a pipeline (e.g. run ./bin/pf_source 5 | ./bin/pf_sink)\n");

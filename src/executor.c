@@ -158,7 +158,7 @@ int executor_run_pipeline(pipeline_t *pipeline, const exec_options_t *opts)
             continue;
         }
 
-        // Decode exit status (W5 milestone)
+        // Decode process exit status
         if (WIFEXITED(status)) {
             stage->exit_code = WEXITSTATUS(status);
             stage->state = STAGE_STATE_EXITED;

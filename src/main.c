@@ -10,7 +10,7 @@
 
 static void print_usage(const char *progname)
 {
-    printf("PipeFlow — A Dataflow Stream Engine (Weeks 1-6 Implementation)\n");
+    printf("PipeFlow — A Dataflow Stream Engine\n");
     printf("Usage:\n");
     printf("  %s                              Start interactive REPL\n", progname);
     printf("  %s run \"<pipeline>\"            Execute inline pipeline\n", progname);
@@ -100,7 +100,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // No arguments provided: launch interactive REPL (Week 1 requirement)
+    // No arguments provided: launch interactive REPL
     repl_run();
     return 0;
 }
