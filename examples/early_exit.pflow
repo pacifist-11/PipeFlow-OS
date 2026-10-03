@@ -1,0 +1,5 @@
+pipeline early_exit_test
+stage src = ./bin/pf_source 1000 0
+stage head = ./bin/pf_head 5
+stage snk = ./bin/pf_sink
+edge src -> head -> snk

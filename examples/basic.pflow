@@ -1,0 +1,5 @@
+pipeline basic_chain
+stage src = ./bin/pf_source 10
+stage xform = ./bin/pf_transform upper
+stage snk = ./bin/pf_sink
+edge src -> xform -> snk

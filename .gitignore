@@ -1,0 +1,4 @@
+pipeflow
+bin/
+*.o
+

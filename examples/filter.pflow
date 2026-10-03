@@ -1,0 +1,5 @@
+pipeline filter_chain
+stage src = ./bin/pf_source 20
+stage flt = ./bin/pf_filter 0005
+stage snk = ./bin/pf_sink
+edge src -> flt -> snk
