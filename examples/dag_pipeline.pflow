@@ -1,0 +1,8 @@
+pipeline diamond_dag
+stage src = ./bin/pf_source 50 0
+stage t_upper = ./bin/pf_transform upper
+stage worker = ./bin/pf_parallel_worker 2
+stage snk = ./bin/pf_sink
+edge src -> t_upper
+edge t_upper -> worker
+edge worker -> snk

@@ -15,34 +15,43 @@ static void print_usage(const char *progname)
     printf("  %s                              Start interactive REPL\n", progname);
     printf("  %s run \"<pipeline>\"            Execute inline pipeline\n", progname);
     printf("  %s -f <config.pflow>            Execute pipeline configuration file\n", progname);
-    printf("  %s -t <seconds> run \"...\"       Execute with timeout alarm\n", progname);
+    printf("  %s -t <seconds> run \"...\"       Execute with timeout alarm (SIGALRM)\n", progname);
     printf("  %s -v run \"...\"                 Verbose mode: print process table\n", progname);
+    printf("  %s -l run \"...\"                 Log redirection: write per-stage stderr to logs/\n", progname);
+    printf("  %s -r run \"...\"                 Auto-restart: restart failed stages\n", progname);
     printf("  %s -h, --help                   Display this help message\n", progname);
     printf("\nExamples:\n");
     printf("  %s run \"./bin/pf_source 10 | ./bin/pf_transform upper | ./bin/pf_sink\"\n", progname);
-    printf("  %s run \"./bin/pf_source 100 | ./bin/pf_head 5 | ./bin/pf_sink\"\n", progname);
+    printf("  %s run \"./bin/pf_source 1000 0 | ./bin/pf_head 5 | ./bin/pf_sink\"\n", progname);
     printf("  %s -f examples/basic.pflow\n", progname);
+    printf("  %s -f examples/dag_pipeline.pflow\n", progname);
 }
 
 int main(int argc, char *argv[])
 {
     exec_options_t opts = {
         .timeout_sec = 0,
-        .verbose = true
+        .verbose = true,
+        .redirect_logs = false,
+        .auto_restart = false,
+        .max_retries = 2
     };
 
     int opt;
     char *config_file = NULL;
 
     static struct option long_options[] = {
-        {"file",    required_argument, 0, 'f'},
-        {"timeout", required_argument, 0, 't'},
-        {"verbose", no_argument,       0, 'v'},
-        {"help",    no_argument,       0, 'h'},
+        {"file",        required_argument, 0, 'f'},
+        {"timeout",     required_argument, 0, 't'},
+        {"verbose",     no_argument,       0, 'v'},
+        {"logs",        no_argument,       0, 'l'},
+        {"restart",     no_argument,       0, 'r'},
+        {"max-retries", required_argument, 0, 'm'},
+        {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "f:t:vh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "f:t:vlrm:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'f':
                 config_file = optarg;
@@ -52,6 +61,15 @@ int main(int argc, char *argv[])
                 break;
             case 'v':
                 opts.verbose = true;
+                break;
+            case 'l':
+                opts.redirect_logs = true;
+                break;
+            case 'r':
+                opts.auto_restart = true;
+                break;
+            case 'm':
+                opts.max_retries = atoi(optarg);
                 break;
             case 'h':
                 print_usage(argv[0]);

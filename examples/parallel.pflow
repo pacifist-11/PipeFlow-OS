@@ -1,0 +1,5 @@
+pipeline parallel_worker_demo
+stage src = ./bin/pf_source 100 0
+stage worker = ./bin/pf_parallel_worker 4
+stage snk = ./bin/pf_sink
+edge src -> worker -> snk

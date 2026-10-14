@@ -1,0 +1,5 @@
+pipeline backpressure_demo
+stage src = ./bin/pf_source 1000 0
+stage xform = ./bin/pf_transform upper
+stage snk = ./bin/pf_sink --delay-ms 1
+edge src -> xform -> snk

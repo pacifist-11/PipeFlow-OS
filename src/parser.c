@@ -121,6 +121,9 @@ pipeline_t *parser_parse_string(const char *name, const char *pipeline_str)
 
                 stage_t *st = stage_create(stage_idx, stage_name, argv[0], argv, argc);
                 pipeline_add_stage(pipe, st);
+                if (stage_idx > 0) {
+                    pipeline_add_edge(pipe, stage_idx - 1, stage_idx);
+                }
                 parser_free_tokens(argv, argc);
                 stage_idx++;
             }
@@ -140,14 +143,15 @@ pipeline_t *parser_parse_string(const char *name, const char *pipeline_str)
         return NULL;
     }
 
+    pipeline_topological_sort(pipe);
     return pipe;
 }
 
-// Structure to temporarily store named stage definitions from .pflow files
+// Structure to store raw edge declarations from file
 typedef struct {
-    char name[64];
-    char cmdline[512];
-} named_stage_def_t;
+    char from[64];
+    char to[64];
+} raw_edge_t;
 
 // Parse a .pflow config file
 pipeline_t *parser_parse_file(const char *filepath)
@@ -161,17 +165,17 @@ pipeline_t *parser_parse_file(const char *filepath)
     }
 
     char pipe_name[128] = "file_pipeline";
-    named_stage_def_t stage_defs[64];
-    int def_count = 0;
+    raw_edge_t raw_edges[PF_MAX_EDGES];
+    int raw_edge_count = 0;
 
-    char edge_chain[1024] = "";
-
+    pipeline_t *pipe = NULL;
     char line[1024];
+
+    // First pass: collect pipeline name and direct inline pipe check
     while (fgets(line, sizeof(line), f)) {
         char *trimmed = trim_whitespace(line);
         if (*trimmed == '#' || *trimmed == '\0' || *trimmed == '/') continue;
 
-        // Check if line is a direct inline pipeline: contains '|' without keyword
         if (strchr(trimmed, '|') && strncmp(trimmed, "pipeline", 8) != 0 && strncmp(trimmed, "stage", 5) != 0) {
             fclose(f);
             return parser_parse_string(pipe_name, trimmed);
@@ -182,62 +186,93 @@ pipeline_t *parser_parse_file(const char *filepath)
             if (*pname) {
                 strncpy(pipe_name, pname, sizeof(pipe_name) - 1);
             }
-        } else if (strncmp(trimmed, "stage", 5) == 0) {
+        }
+    }
+
+    pipe = pipeline_create(pipe_name);
+    if (!pipe) {
+        fclose(f);
+        return NULL;
+    }
+
+    // Second pass: instantiate stages and collect edges
+    rewind(f);
+    while (fgets(line, sizeof(line), f)) {
+        char *trimmed = trim_whitespace(line);
+        if (*trimmed == '#' || *trimmed == '\0' || *trimmed == '/') continue;
+
+        if (strncmp(trimmed, "stage", 5) == 0) {
             char *rest = trim_whitespace(trimmed + 5);
             char *eq = strchr(rest, '=');
-            if (eq && def_count < 64) {
+            if (eq) {
                 *eq = '\0';
                 char *sname = trim_whitespace(rest);
                 char *scmd = trim_whitespace(eq + 1);
-                strncpy(stage_defs[def_count].name, sname, sizeof(stage_defs[def_count].name) - 1);
-                strncpy(stage_defs[def_count].cmdline, scmd, sizeof(stage_defs[def_count].cmdline) - 1);
-                def_count++;
+
+                int argc = 0;
+                char **argv = parser_tokenize_command(scmd, &argc);
+                if (argv && argc > 0) {
+                    stage_t *st = stage_create(pipe->stage_count, sname, argv[0], argv, argc);
+                    pipeline_add_stage(pipe, st);
+                    parser_free_tokens(argv, argc);
+                }
             }
         } else if (strncmp(trimmed, "edge", 4) == 0 || strncmp(trimmed, "pipeline_chain", 14) == 0) {
             char *rest = strstr(trimmed, "edge") ? trimmed + 4 : trimmed + 14;
-            strncpy(edge_chain, trim_whitespace(rest), sizeof(edge_chain) - 1);
+            char edge_line[512];
+            strncpy(edge_line, trim_whitespace(rest), sizeof(edge_line) - 1);
+            edge_line[sizeof(edge_line) - 1] = '\0';
+
+            // Split by "->" to get sequence of stages
+            char *saveptr = NULL;
+            char *node = strtok_r(edge_line, "->", &saveptr);
+            char prev_node[64] = "";
+
+            while (node) {
+                char *curr_node = trim_whitespace(node);
+                if (strlen(prev_node) > 0 && strlen(curr_node) > 0 && raw_edge_count < PF_MAX_EDGES) {
+                    strncpy(raw_edges[raw_edge_count].from, prev_node, 63);
+                    strncpy(raw_edges[raw_edge_count].to, curr_node, 63);
+                    raw_edge_count++;
+                }
+                strncpy(prev_node, curr_node, 63);
+                node = strtok_r(NULL, "->", &saveptr);
+            }
         }
     }
     fclose(f);
 
-    // If edges specified like "s1 -> s2 -> s3"
-    if (strlen(edge_chain) > 0 && def_count > 0) {
-        pipeline_t *pipe = pipeline_create(pipe_name);
-        char *tok = strtok(edge_chain, "-> \t");
-        int stage_idx = 0;
-        while (tok) {
-            char *sname = trim_whitespace(tok);
-            for (int i = 0; i < def_count; i++) {
-                if (strcmp(stage_defs[i].name, sname) == 0) {
-                    int argc = 0;
-                    char **argv = parser_tokenize_command(stage_defs[i].cmdline, &argc);
-                    if (argv && argc > 0) {
-                        stage_t *st = stage_create(stage_idx++, stage_defs[i].name, argv[0], argv, argc);
-                        pipeline_add_stage(pipe, st);
-                        parser_free_tokens(argv, argc);
-                    }
-                    break;
-                }
-            }
-            tok = strtok(NULL, "-> \t");
-        }
-        return pipe;
+    if (pipe->stage_count == 0) {
+        pipeline_free(pipe);
+        return NULL;
     }
 
-    // If no edge line, but stages were declared in order
-    if (def_count > 0) {
-        pipeline_t *pipe = pipeline_create(pipe_name);
-        for (int i = 0; i < def_count; i++) {
-            int argc = 0;
-            char **argv = parser_tokenize_command(stage_defs[i].cmdline, &argc);
-            if (argv && argc > 0) {
-                stage_t *st = stage_create(i, stage_defs[i].name, argv[0], argv, argc);
-                pipeline_add_stage(pipe, st);
-                parser_free_tokens(argv, argc);
+    // Connect edges
+    if (raw_edge_count > 0) {
+        for (int i = 0; i < raw_edge_count; i++) {
+            int u = pipeline_find_stage_by_name(pipe, raw_edges[i].from);
+            int v = pipeline_find_stage_by_name(pipe, raw_edges[i].to);
+            if (u >= 0 && v >= 0) {
+                pipeline_add_edge(pipe, u, v);
+            } else {
+                fprintf(stderr, "PipeFlow: Warning: edge '%s -> %s' references unknown stage\n",
+                        raw_edges[i].from, raw_edges[i].to);
             }
         }
-        return pipe;
+        pipe->is_dag = true;
+    } else {
+        // Default linear chain if no edges specified
+        for (int i = 0; i < pipe->stage_count - 1; i++) {
+            pipeline_add_edge(pipe, i, i + 1);
+        }
     }
 
-    return NULL;
+    // Run topological sort and verify DAG acyclicity
+    if (!pipeline_topological_sort(pipe)) {
+        fprintf(stderr, "PipeFlow Error: Cycle detected in pipeline DAG '%s'! Graph must be acyclic.\n", pipe->name);
+        pipeline_free(pipe);
+        return NULL;
+    }
+
+    return pipe;
 }

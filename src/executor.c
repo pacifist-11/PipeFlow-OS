@@ -5,8 +5,88 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+
+// Helper to spawn a single stage with given in/out fds
+static pid_t spawn_stage(pipeline_t *pipeline, int stage_idx, int in_fd, int out_fd, const exec_options_t *opts)
+{
+    stage_t *stage = pipeline->stages[stage_idx];
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("PipeFlow: fork() failed");
+        stage->state = STAGE_STATE_FAILED;
+        return -1;
+    }
+
+    if (pid == 0) {
+        // === CHILD PROCESS ===
+        // 1. Process group management
+        if (pipeline->pgid == 0) {
+            setpgid(0, 0); // Becomes group leader
+        } else {
+            setpgid(0, pipeline->pgid); // Join existing group leader
+        }
+
+        // 2. Log redirection if requested (Week 9 requirement)
+        if (opts && opts->redirect_logs) {
+            mkdir("logs", 0755);
+            snprintf(stage->log_file, sizeof(stage->log_file), "logs/%s.log", stage->name);
+            int log_fd = open(stage->log_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (log_fd >= 0) {
+                dup2(log_fd, STDERR_FILENO);
+                close(log_fd);
+            }
+        }
+
+        // 3. Duplicate descriptors onto STDIN and STDOUT
+        if (in_fd != STDIN_FILENO && in_fd >= 0) {
+            if (dup2(in_fd, STDIN_FILENO) < 0) {
+                perror("PipeFlow child: dup2(in_fd) failed");
+                _exit(1);
+            }
+        }
+        if (out_fd != STDOUT_FILENO && out_fd >= 0) {
+            if (dup2(out_fd, STDOUT_FILENO) < 0) {
+                perror("PipeFlow child: dup2(out_fd) failed");
+                _exit(1);
+            }
+        }
+
+        // 4. Critical: Close ALL pipe descriptors across all edges in child
+        for (int e = 0; e < pipeline->edge_count; e++) {
+            if (pipeline->edges[e].pipe_fd[0] >= 0) close(pipeline->edges[e].pipe_fd[0]);
+            if (pipeline->edges[e].pipe_fd[1] >= 0) close(pipeline->edges[e].pipe_fd[1]);
+        }
+
+        // 5. Reset signal dispositions to defaults
+        signals_setup_child();
+
+        // 6. Execute program via PATH resolution
+        execvp(stage->command, stage->argv);
+
+        // If execvp returns, execution failed
+        fprintf(stderr, "PipeFlow: stage '%s' failed to execute '%s': %s\n",
+                stage->name, stage->command, strerror(errno));
+        _exit(127);
+    }
+
+    // === PARENT PROCESS ===
+    stage->pid = pid;
+    stage->state = STAGE_STATE_RUNNING;
+
+    if (pipeline->pgid == 0) {
+        pipeline->pgid = pid;
+        setpgid(pid, pid);
+    } else {
+        setpgid(pid, pipeline->pgid);
+    }
+
+    return pid;
+}
 
 int executor_run_pipeline(pipeline_t *pipeline, const exec_options_t *opts)
 {
@@ -15,31 +95,20 @@ int executor_run_pipeline(pipeline_t *pipeline, const exec_options_t *opts)
         return -1;
     }
 
-    int n = pipeline->stage_count;
-    int (*pipes)[2] = NULL;
-
-    if (n > 1) {
-        pipes = malloc((n - 1) * sizeof(int[2]));
-        if (!pipes) {
-            perror("PipeFlow: malloc pipes failed");
-            return -1;
-        }
-
-        for (int i = 0; i < n - 1; i++) {
-            if (pipe(pipes[i]) < 0) {
-                perror("PipeFlow: pipe() creation failed");
-                // Close previously created pipes
-                for (int j = 0; j < i; j++) {
-                    close(pipes[j][0]);
-                    close(pipes[j][1]);
-                }
-                free(pipes);
-                return -1;
+    // 1. Create pipes for all defined edges
+    for (int e = 0; e < pipeline->edge_count; e++) {
+        if (pipe(pipeline->edges[e].pipe_fd) < 0) {
+            perror("PipeFlow: pipe() creation failed");
+            // Close already opened pipes
+            for (int k = 0; k < e; k++) {
+                close(pipeline->edges[k].pipe_fd[0]);
+                close(pipeline->edges[k].pipe_fd[1]);
             }
+            return -1;
         }
     }
 
-    // Register active pipeline with signal subsystem
+    // 2. Register active pipeline with signal subsystem
     signals_setup_parent(pipeline);
     pipeline->is_running = true;
     pipeline->pgid = 0;
@@ -48,91 +117,53 @@ int executor_run_pipeline(pipeline_t *pipeline, const exec_options_t *opts)
         signals_set_timeout(opts->timeout_sec);
     }
 
-    // Fork and wire all stages
-    for (int i = 0; i < n; i++) {
-        stage_t *stage = pipeline->stages[i];
+    // 3. Launch stages in topological dependency order (Kahn's DAG schedule)
+    for (int step = 0; step < pipeline->stage_count; step++) {
+        int idx = pipeline->topo_order[step];
+        stage_t *stage = pipeline->stages[idx];
 
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("PipeFlow: fork() failed");
-            stage->state = STAGE_STATE_FAILED;
-            // Clean up all running children
+        // Determine input fd (from incoming edge)
+        int in_fd = STDIN_FILENO;
+        for (int e = 0; e < pipeline->edge_count; e++) {
+            if (pipeline->edges[e].to_stage == idx) {
+                in_fd = pipeline->edges[e].pipe_fd[0];
+                break;
+            }
+        }
+
+        // Determine output fd (from outgoing edge)
+        int out_fd = STDOUT_FILENO;
+        for (int e = 0; e < pipeline->edge_count; e++) {
+            if (pipeline->edges[e].from_stage == idx) {
+                out_fd = pipeline->edges[e].pipe_fd[1];
+                break;
+            }
+        }
+
+        stage->in_fd = in_fd;
+        stage->out_fd = out_fd;
+
+        if (spawn_stage(pipeline, idx, in_fd, out_fd, opts) < 0) {
             pipeline_teardown(pipeline);
             break;
         }
+    }
 
-        if (pid == 0) {
-            // === CHILD PROCESS ===
-            // 1. Process group management
-            if (i == 0) {
-                setpgid(0, 0); // Becomes group leader
-            } else {
-                setpgid(0, pipeline->pgid); // Join group leader
-            }
-
-            // 2. Determine input and output file descriptors
-            int in_fd = (i == 0) ? STDIN_FILENO : pipes[i - 1][0];
-            int out_fd = (i == n - 1) ? STDOUT_FILENO : pipes[i][1];
-
-            // 3. Duplicate descriptors onto STDIN and STDOUT
-            if (in_fd != STDIN_FILENO) {
-                if (dup2(in_fd, STDIN_FILENO) < 0) {
-                    perror("PipeFlow child: dup2(in_fd) failed");
-                    _exit(1);
-                }
-            }
-            if (out_fd != STDOUT_FILENO) {
-                if (dup2(out_fd, STDOUT_FILENO) < 0) {
-                    perror("PipeFlow child: dup2(out_fd) failed");
-                    _exit(1);
-                }
-            }
-
-            // 4. Critical: Close ALL pipe descriptors in child to ensure EOF propagation
-            if (n > 1) {
-                for (int k = 0; k < n - 1; k++) {
-                    close(pipes[k][0]);
-                    close(pipes[k][1]);
-                }
-            }
-
-            // 5. Reset signal dispositions to defaults
-            signals_setup_child();
-
-            // 6. Execute program via PATH resolution
-            execvp(stage->command, stage->argv);
-
-            // If execvp returns, an error occurred
-            fprintf(stderr, "PipeFlow: stage '%s' failed to execute '%s': %s\n",
-                    stage->name, stage->command, strerror(errno));
-            _exit(127);
+    // 4. Critical: Close all pipe descriptors in parent process so EOF reaches readers
+    for (int e = 0; e < pipeline->edge_count; e++) {
+        if (pipeline->edges[e].pipe_fd[0] >= 0) {
+            close(pipeline->edges[e].pipe_fd[0]);
+            pipeline->edges[e].pipe_fd[0] = -1;
         }
-
-        // === PARENT PROCESS ===
-        stage->pid = pid;
-        stage->state = STAGE_STATE_RUNNING;
-
-        if (i == 0) {
-            pipeline->pgid = pid; // First child is process group leader
-            setpgid(pid, pid);
-        } else {
-            setpgid(pid, pipeline->pgid);
+        if (pipeline->edges[e].pipe_fd[1] >= 0) {
+            close(pipeline->edges[e].pipe_fd[1]);
+            pipeline->edges[e].pipe_fd[1] = -1;
         }
     }
 
-    // Critical: Close all pipe descriptors in parent process so writer closure reaches readers
-    if (n > 1 && pipes) {
-        for (int i = 0; i < n - 1; i++) {
-            close(pipes[i][0]);
-            close(pipes[i][1]);
-        }
-        free(pipes);
-        pipes = NULL;
-    }
-
-    // Wait for all stages to complete and collect exit statuses
+    // 5. Wait for all stages to complete and collect exit statuses
     int overall_status = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < pipeline->stage_count; i++) {
         stage_t *stage = pipeline->stages[i];
         if (stage->pid <= 0) continue;
 
@@ -148,7 +179,6 @@ int executor_run_pipeline(pipeline_t *pipeline, const exec_options_t *opts)
                     fprintf(stderr, "\nPipeFlow: Interrupt received on '%s'! Tearing down...\n", pipeline->name);
                     pipeline_teardown(pipeline);
                 }
-                // Retry waitpid
                 i--;
                 continue;
             }
@@ -162,12 +192,40 @@ int executor_run_pipeline(pipeline_t *pipeline, const exec_options_t *opts)
         if (WIFEXITED(status)) {
             stage->exit_code = WEXITSTATUS(status);
             stage->state = STAGE_STATE_EXITED;
+
+            // Dynamic Stage Restart (Stretch goal / Distinction bar)
+            if (stage->exit_code != 0 && opts && opts->auto_restart &&
+                stage->restarts < opts->max_retries) {
+                stage->restarts++;
+                fprintf(stderr, "[PipeFlow Supervisor] Stage '%s' (PID %d) exited with code %d. Restarting (attempt %d/%d)...\n",
+                        stage->name, stage->pid, stage->exit_code, stage->restarts, opts->max_retries);
+
+                // Re-spawn stage
+                pid_t new_pid = spawn_stage(pipeline, stage->id, stage->in_fd, stage->out_fd, opts);
+                if (new_pid > 0) {
+                    i--; // Re-wait on this stage
+                    continue;
+                }
+            }
+
             if (stage->exit_code != 0) {
                 overall_status = stage->exit_code;
             }
         } else if (WIFSIGNALED(status)) {
             stage->term_sig = WTERMSIG(status);
             stage->state = STAGE_STATE_SIGNALED;
+
+            if (opts && opts->auto_restart && stage->restarts < opts->max_retries && stage->term_sig != SIGTERM) {
+                stage->restarts++;
+                fprintf(stderr, "[PipeFlow Supervisor] Stage '%s' (PID %d) killed by signal %d. Restarting...\n",
+                        stage->name, stage->pid, stage->term_sig);
+                pid_t new_pid = spawn_stage(pipeline, stage->id, stage->in_fd, stage->out_fd, opts);
+                if (new_pid > 0) {
+                    i--;
+                    continue;
+                }
+            }
+
             overall_status = 128 + stage->term_sig;
         }
     }

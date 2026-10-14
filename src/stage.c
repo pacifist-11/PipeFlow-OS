@@ -54,6 +54,10 @@ stage_t *stage_create(int id, const char *name, const char *cmd, char **argv, in
     s->term_sig = 0;
     s->in_fd = STDIN_FILENO;
     s->out_fd = STDOUT_FILENO;
+    s->restarts = 0;
+    s->in_degree = 0;
+    s->out_degree = 0;
+    s->log_file[0] = '\0';
 
     return s;
 }
@@ -84,6 +88,8 @@ pipeline_t *pipeline_create(const char *name)
     p->stage_capacity = 8;
     p->stages = (stage_t **)calloc(p->stage_capacity, sizeof(stage_t *));
     p->stage_count = 0;
+    p->edge_count = 0;
+    p->is_dag = false;
     p->pgid = 0;
     p->is_running = false;
 
@@ -107,6 +113,90 @@ bool pipeline_add_stage(pipeline_t *pipe, stage_t *stage)
     return true;
 }
 
+int pipeline_find_stage_by_name(const pipeline_t *pipe, const char *name)
+{
+    if (!pipe || !name) return -1;
+    for (int i = 0; i < pipe->stage_count; i++) {
+        if (strcmp(pipe->stages[i]->name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool pipeline_add_edge(pipeline_t *pipe, int from_id, int to_id)
+{
+    if (!pipe || from_id < 0 || to_id < 0 ||
+        from_id >= pipe->stage_count || to_id >= pipe->stage_count) {
+        return false;
+    }
+    if (pipe->edge_count >= PF_MAX_EDGES) return false;
+
+    // Check duplicate
+    for (int i = 0; i < pipe->edge_count; i++) {
+        if (pipe->edges[i].from_stage == from_id && pipe->edges[i].to_stage == to_id) {
+            return true;
+        }
+    }
+
+    edge_t *e = &pipe->edges[pipe->edge_count++];
+    e->from_stage = from_id;
+    e->to_stage = to_id;
+    e->pipe_fd[0] = -1;
+    e->pipe_fd[1] = -1;
+    e->active = true;
+
+    pipe->stages[from_id]->out_degree++;
+    pipe->stages[to_id]->in_degree++;
+    return true;
+}
+
+// Kahn's algorithm for topological sorting of stages in DAG
+bool pipeline_topological_sort(pipeline_t *pipe)
+{
+    if (!pipe || pipe->stage_count == 0) return false;
+
+    int in_deg[PF_MAX_STAGES];
+    for (int i = 0; i < pipe->stage_count; i++) {
+        in_deg[i] = 0;
+    }
+
+    for (int i = 0; i < pipe->edge_count; i++) {
+        int v = pipe->edges[i].to_stage;
+        if (v >= 0 && v < pipe->stage_count) {
+            in_deg[v]++;
+        }
+    }
+
+    int queue[PF_MAX_STAGES];
+    int front = 0, rear = 0;
+
+    for (int i = 0; i < pipe->stage_count; i++) {
+        if (in_deg[i] == 0) {
+            queue[rear++] = i;
+        }
+    }
+
+    int visited_count = 0;
+    while (front < rear) {
+        int u = queue[front++];
+        pipe->topo_order[visited_count++] = u;
+
+        for (int i = 0; i < pipe->edge_count; i++) {
+            if (pipe->edges[i].from_stage == u) {
+                int v = pipe->edges[i].to_stage;
+                in_deg[v]--;
+                if (in_deg[v] == 0) {
+                    queue[rear++] = v;
+                }
+            }
+        }
+    }
+
+    // If visited_count != stage_count, graph has a cycle!
+    return (visited_count == pipe->stage_count);
+}
+
 void pipeline_free(pipeline_t *pipe)
 {
     if (!pipe) return;
@@ -121,12 +211,13 @@ void pipeline_print_table(const pipeline_t *pipe)
 {
     if (!pipe) return;
 
-    printf("\n========================================================================================\n");
-    printf(" PIPELINE PROCESS TABLE: %s (Stages: %d, PGID: %d)\n", pipe->name, pipe->stage_count, pipe->pgid);
-    printf("----------------------------------------------------------------------------------------\n");
-    printf(" %-4s | %-12s | %-7s | %-10s | %-10s | %-28s\n",
-           "ID", "STAGE NAME", "PID", "STATE", "STATUS", "COMMAND");
-    printf("----------------------------------------------------------------------------------------\n");
+    printf("\n====================================================================================================\n");
+    printf(" PIPELINE PROCESS TABLE: %s (Stages: %d, Edges: %d, PGID: %d)\n",
+           pipe->name, pipe->stage_count, pipe->edge_count, pipe->pgid);
+    printf("----------------------------------------------------------------------------------------------------\n");
+    printf(" %-4s | %-14s | %-7s | %-10s | %-10s | %-8s | %-32s\n",
+           "ID", "STAGE NAME", "PID", "STATE", "STATUS", "RESTARTS", "COMMAND");
+    printf("----------------------------------------------------------------------------------------------------\n");
 
     for (int i = 0; i < pipe->stage_count; i++) {
         stage_t *s = pipe->stages[i];
@@ -142,7 +233,6 @@ void pipeline_print_table(const pipeline_t *pipe)
             snprintf(status_buf, sizeof(status_buf), "running");
         }
 
-        // Build cmdline string for display
         char cmd_buf[128] = "";
         int offset = 0;
         for (int a = 0; a < s->argc && offset < 120; a++) {
@@ -150,13 +240,14 @@ void pipeline_print_table(const pipeline_t *pipe)
                                s->argv[a], (a + 1 < s->argc) ? " " : "");
         }
 
-        printf(" %-4d | %-12s | %-7d | %-10s | %-10s | %-28s\n",
+        printf(" %-4d | %-14s | %-7d | %-10s | %-10s | %-8d | %-32s\n",
                s->id,
                s->name,
                s->pid > 0 ? s->pid : 0,
                stage_state_to_string(s->state),
                status_buf,
+               s->restarts,
                cmd_buf);
     }
-    printf("========================================================================================\n\n");
+    printf("====================================================================================================\n\n");
 }
